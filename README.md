@@ -82,4 +82,4 @@ breakpoints, `finish` / `until`, backtrace, DWARF variables and types, other arc
 
 ## License
 
-Not yet chosen. Add a `LICENSE` file before publishing.
+GPL-3.0 license
