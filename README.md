@@ -5,12 +5,12 @@ radare2-style control-flow graph on one screen. The graph follows the instructio
 as you step, so you always see where you are in the structure of the function.
 
 ```
-+- regs ---------------+- main: graph / code / source / vmmap / find ------+
++- regs ---------------+- main: graph / code / source / vmmap / find -------+
 | rax ...   rbx ...    |  [0x401136] <main>                                 |
 | rip  eflags [ZF cf]  |   push rbp ...                                     |
-+- stack --------------+- hexdump -----------------------------------------+
++- stack --------------+- hexdump ------------------------------------------+
 +- log ----------------+- target (the program's own terminal) --------------+
-+- status: stop reason, address, <symbol>, file:line ----------------------+
++- status: stop reason, address, <symbol>, file:line -----------------------+
 ```
 
 ## Features
