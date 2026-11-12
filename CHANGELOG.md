@@ -3,6 +3,57 @@
 All notable changes to dbgt are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.2.0] - 2026-11-12
+
+Static analysis, a pwn-focused workflow, and depth features. No changes to the debugger core's
+existing behaviour — everything below is additive.
+
+### Added
+
+**Static ELF browser (no running process needed)**
+- `sections`, `segments` (real program headers with r/w/x), `symtab [filter]`, `imports [filter]`
+  / `got` / `plt`, `strings [filter]` — a binsider-style tabbed browser (`6` or `g` to open,
+  `[`/`]` to switch tabs), computed once and cached per binary.
+
+**ROP and pwn workflow**
+- `rop [filter]` — gadget search (`ret`/indirect `jmp`/`call` tails, backward-decoded with
+  iced-x86, deduplicated).
+- `cyclic <N>`, `cyclic send <N>`, `cyclic -l <leak>` — pwntools-compatible De Bruijn patterns,
+  plus automatic crash-offset detection against every general-purpose register on
+  SIGSEGV/SIGBUS/SIGILL.
+- `bt` / `finish` — frame-pointer backtrace and run-until-return, reusing `next`'s one-shot
+  breakpoint mechanism.
+- `libc <path> <symbol> [leaked addr]` — offline ret2libc helper: symbol offset, predicted base
+  and `system`/`execve`/`"/bin/sh"` addresses, plus **onegadget-lite**: a scoped, single-path
+  constant-propagation scan for `execve`/`system` call sites (explicitly not a replacement for
+  real `one_gadget` — see the User Guide, §7.10).
+- hexyl-style hexdump byte-class colouring, and a two-line ImHex-style data inspector
+  (`h`/`l` to move the byte cursor) showing every integer/float interpretation of the selected
+  byte plus a string preview.
+
+**Depth**
+- Bookmarks and notes (`bookmark`, `note`), saved to a small hand-rolled text file next to the
+  executable (`<exe>.dbgt-session`) and reloaded automatically.
+- `struct load <path>` / `struct <Name> [@<addr>]` / `struct clear` — an ImHex-style struct
+  overlay for the hexdump pane, with its own small C-like definition language.
+- `dbgt init` — a separate, non-TUI subcommand for pwninit-style libc/ld patching (shells out to
+  `patchelf`).
+
+### Fixed
+
+- A `Cmd::Finish`/`Cmd::Backtrace` enum-declaration gap that broke the release build (the match
+  arms and call sites were added without adding the variants themselves) — see the Architecture
+  doc's "Extending dbgt" section for the check that now guards against this recurring.
+
+### Known issues
+
+- Still no automated tests (see [0.1.0]'s known issues — now with substantially more pure,
+  easily-testable code waiting for them: `gadgets`, `statics`, `cyclic`, `onegadget`,
+  `session`, `structs`).
+- `gimli::Dwarf::borrow` deprecation warning, unchanged from 0.1.0.
+- See the User Guide, section 8, and the Architecture doc, section 6, for the complete,
+  up-to-date limitations list.
+
 ## [0.1.0] - 2026-10-25
 
 First release. Linux x86_64 ELF only.

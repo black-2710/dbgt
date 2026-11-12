@@ -1,6 +1,6 @@
 [package]
 name = "dbgt"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "TUI debugger: GEF-style dashboard + r2-style CFG (Linux x86_64)"
 

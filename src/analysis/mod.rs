@@ -1,6 +1,10 @@
 pub mod cfg;
 pub mod checksec;
+pub mod cyclic;
 pub mod disasm;
+pub mod gadgets;
 pub mod layout;
 pub mod lines;
+pub mod onegadget;
+pub mod statics;
 pub mod symbols;

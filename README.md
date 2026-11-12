@@ -1,85 +1,48 @@
 # dbgt
 
-A terminal debugger for **Linux x86_64** that puts a GEF-style live dashboard and a
-radare2-style control-flow graph on one screen. The graph follows the instruction pointer
-as you step, so you always see where you are in the structure of the function.
+A TUI debugger for dissecting Linux x86_64 ELF binaries — a GEF-style always-on dashboard, an
+r2-style control-flow graph that follows RIP, and a pwn-focused toolset (ROP gadgets, cyclic
+patterns, a libc/ret2libc helper, bookmarks, and more) in one terminal window.
 
-```
-+- regs ---------------+- main: graph / code / source / vmmap / find -------+
-| rax ...   rbx ...    |  [0x401136] <main>                                 |
-| rip  eflags [ZF cf]  |   push rbp ...                                     |
-+- stack --------------+- hexdump ------------------------------------------+
-+- log ----------------+- target (the program's own terminal) --------------+
-+- status: stop reason, address, <symbol>, file:line -----------------------+
-```
+Builds and runs with `cargo build --release` — confirmed on a real build as of this writing.
 
-## Features
+## What's in here
 
-- **Live dashboard**: registers (changed ones in red), stack telescope with pointer chains,
-  hexdump, log, and the target's own terminal, all visible at once.
-- **Pane-based control**: `Tab` / `Shift-Tab` move focus between six panes; each pane has its
-  own keys and context-aware commands. `f` maximises the focused pane.
-- **r2-style graph**: basic blocks as boxes, red `f` / green `t` / blue edges, loop edges,
-  current block highlighted, per-block hit counters, and following calls into callees.
-- **Symbols everywhere**: the executable plus libc, ld.so and every loaded library, including
-  `name@plt` stubs.
-- **DWARF line info**: `file.c:12` annotations, a source view, and `b file.c:42`.
-- **Real terminal for the target**: it runs on a pty, so programs that read input work and
-  output is not block-buffered.
-- **Hardware watchpoints** using the CPU debug registers.
-- **Edit state**: `set $rax 0x41` and `write <addr> <bytes>`.
-- **Pwn tools**: `checksec`, a colour-coded vmmap, memory `find`.
+- **Always-on dashboard**: registers, a 48-slot stack telescope with pointer-chain resolution,
+  a colourised hexdump with a per-byte data inspector, and the target's own terminal, live.
+- **Control-flow graph**: recovers basic blocks, lays them out, and follows the instruction
+  pointer as you step — select a call and jump into it, then back out.
+- **Static ELF browser**: sections, segments, the full symbol table, imports/GOT, and a string
+  scan, all browsable the moment you open a binary — no need to run it first.
+- **Pwn workflow**: `rop` (gadget search), `cyclic` (De Bruijn patterns with automatic
+  crash-offset detection), `bt` / `finish`, a `libc` helper for ret2libc (base + system +
+  execve + `/bin/sh`, plus scoped `onegadget`-style candidates), `checksec`, `find`, hardware
+  watchpoints, memory/register patching.
+- **Depth**: bookmarks and notes saved alongside the binary, an ImHex-style struct overlay for
+  the hexdump, and a `dbgt init` subcommand for pwninit-style libc/ld patching.
 
-## Requirements
+See **[docs/user/USER_GUIDE.md](docs/user/USER_GUIDE.md)** for the full command reference, key
+bindings, and feature walkthroughs, and **[docs/dev/ARCHITECTURE.md](docs/dev/ARCHITECTURE.md)**
+for how it's put together if you want to extend it.
 
-- Linux on x86_64 with `/proc` mounted
-- A recent stable Rust toolchain (1.80 or newer recommended)
-- A terminal of about 104 x 28 or larger with Unicode box-drawing and colour
-
-## Build and run
+## Quick start
 
 ```
 cargo build --release
-./target/release/dbgt ./yourbinary [args...]
+./target/release/dbgt ./some_binary
 ```
 
-Then press `:`, type `start`, press Enter. Use `s` to step, `n` to step over, `c` to continue,
-`Tab` to change pane, `?` for help, `q` to quit.
-
-Containers need `CAP_SYS_PTRACE`; see the [User Guide](docs/USER_GUIDE.md#2-installation) for
-permissions.
-
-## Keys at a glance
-
-| Everywhere | |
-|---|---|
-| `Tab` / `Shift-Tab` | next / previous pane |
-| `:` | command line (`Enter` on an empty line repeats the last command) |
-| `s` `n` `c` (or `F7` `F8` `F5`) | step / step over / continue |
-| `f` | maximise the focused pane |
-| `?` | help in the log |
-| `Ctrl-C` | interrupt a running target (quit when idle) |
-| `q` | quit |
-
-Each pane adds its own keys; the focused pane's keys are always shown on the bottom bar.
-Full tables are in the [User Guide](docs/USER_GUIDE.md#5-panes-and-keys).
-
-## Documentation
-
-- [User Guide](docs/USER_GUIDE.md): installation, panes, keys, every command, feature guides,
-  troubleshooting, cheat sheet
-- [Architecture](docs/ARCHITECTURE.md): threads, protocol, module map, algorithms, how to extend
-- [Changelog](CHANGELOG.md)
+Inside: `:start` to run to `main`, `s`/`n`/`c` to step/step-over/continue, `Tab` to move
+between panes, `:` to open the command line, `?` for a full command list.
 
 ## Status
 
-Early-stage (0.1.0). dbgt has no automated test suite yet, so behaviour on unusual binaries is
-untested. If something misbehaves, open an issue with what you typed, what you saw (a
-screenshot helps) and the output of `checksec` for the binary.
-
-Not yet implemented: attaching to a running process, following forks and threads, conditional
-breakpoints, `finish` / `until`, backtrace, DWARF variables and types, other architectures.
+Linux x86_64 ELF only. No threads/forks yet, no DWARF variable/type info, frame-pointer-only
+backtraces (wrong on `-fomit-frame-pointer` builds). See the User Guide's Limitations section
+and the Architecture doc's Known Limitations section for the complete, honest list — several
+features here are deliberately scoped down from what a full-strength tool would do, and say so
+in their own output, not just in these docs.
 
 ## License
 
-GPL-3.0 license
+GPL-3.0 — see [LICENSE](LICENSE).

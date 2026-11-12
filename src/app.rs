@@ -1,11 +1,15 @@
 use crate::analysis::{
+    cyclic,
     disasm::{disasm, Insn},
+    statics::StaticInfo,
     symbols::Symbols,
 };
 use crate::analysis::symbols::short;
 use crate::graph::GraphView;
-use crate::backend::{Cmd, Event, Found, MapEntry, Regs, Snapshot, Views};
-use crate::cmd::{self, Command};
+use crate::backend::{Cmd, Event, Found, GadgetList, MapEntry, Regs, Snapshot, Stop, Views};
+use crate::cmd::{self, BookmarkOp, Command, NoteOp, StructOp};
+use crate::session::Session;
+use crate::structs::{self, StructDef};
 use nix::{
     sys::signal::{kill, Signal},
     unistd::Pid,
@@ -59,6 +63,50 @@ pub enum ViewMode {
     Maps,
     /// Output of the last `find` (reached by running it, not by `g`).
     Results,
+    /// Output of the last `rop` (reached by running it, not by `g`).
+    Gadgets,
+    /// Static ELF browser: sections / segments / symtab / imports / strings,
+    /// selected by `App::statics_tab`.
+    Statics,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum StaticsTab {
+    Sections,
+    Segments,
+    Symtab,
+    Imports,
+    Strings,
+}
+
+impl StaticsTab {
+    fn next(self) -> Self {
+        match self {
+            StaticsTab::Sections => StaticsTab::Segments,
+            StaticsTab::Segments => StaticsTab::Symtab,
+            StaticsTab::Symtab => StaticsTab::Imports,
+            StaticsTab::Imports => StaticsTab::Strings,
+            StaticsTab::Strings => StaticsTab::Sections,
+        }
+    }
+    fn prev(self) -> Self {
+        match self {
+            StaticsTab::Sections => StaticsTab::Strings,
+            StaticsTab::Segments => StaticsTab::Sections,
+            StaticsTab::Symtab => StaticsTab::Segments,
+            StaticsTab::Imports => StaticsTab::Symtab,
+            StaticsTab::Strings => StaticsTab::Imports,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            StaticsTab::Sections => "sections",
+            StaticsTab::Segments => "segments",
+            StaticsTab::Symtab => "symtab",
+            StaticsTab::Imports => "imports",
+            StaticsTab::Strings => "strings",
+        }
+    }
 }
 
 pub struct App {
@@ -76,6 +124,19 @@ pub struct App {
     pub mode: ViewMode,
     pub maps: Arc<Vec<MapEntry>>,
     pub found: Option<Found>,
+    pub gadgets: Option<Arc<GadgetList>>,
+    /// Byte offset into `views.hex` of the selected byte (data inspector).
+    pub hex_sel: usize,
+    pub statics: Option<Arc<StaticInfo>>,
+    pub session: Session,
+    pub struct_defs: Vec<StructDef>,
+    /// (struct name, base address) currently overlaid on the hexdump pane.
+    pub active_struct: Option<(String, u64)>,
+    pub statics_tab: StaticsTab,
+    /// Per-tab text filters (substring, case-sensitive), set by `symtab <f>` etc.
+    pub sym_filter: String,
+    pub imp_filter: String,
+    pub str_filter: String,
     /// Scroll position of the Maps / Results lists.
     pub list_scroll: Cell<usize>,
     /// Source files read for the source view (None = unreadable).
@@ -113,9 +174,12 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(cmd_tx: Sender<Cmd>) -> Self {
+    pub fn new(cmd_tx: Sender<Cmd>, program: &str) -> Self {
         App {
             cmd_tx,
+            session: Session::load(program),
+            struct_defs: Vec::new(),
+            active_struct: None,
             pid: None,
             snap: None,
             prev: None,
@@ -127,6 +191,13 @@ impl App {
             mode: ViewMode::Graph,
             maps: Arc::new(Vec::new()),
             found: None,
+            gadgets: None,
+            hex_sel: 0,
+            statics: None,
+            statics_tab: StaticsTab::Sections,
+            sym_filter: String::new(),
+            imp_filter: String::new(),
+            str_filter: String::new(),
             list_scroll: Cell::new(0),
             src_cache: RefCell::new(HashMap::new()),
             last_src: None,
@@ -183,6 +254,9 @@ impl App {
                     self.last_src = Some((p.to_string(), l));
                 }
                 self.status = st;
+                if let Stop::Signal(sig) = snap.stop {
+                    self.suggest_cyclic_offset(sig, &snap.regs);
+                }
                 self.snap = Some(snap);
                 self.busy = false;
                 self.browse.clear(); // a real stop snaps the view back to the live function
@@ -202,7 +276,12 @@ impl App {
                 self.status = format!("{stop}");
                 self.push_log(format!("process {stop}"));
             }
-            Event::Views(v) => self.views = Some(v),
+            Event::Views(v) => {
+                // A new base address: clamp (don't reset) the inspector cursor so
+                // scrolling a line or a page keeps the same on-screen cell selected.
+                self.hex_sel = self.hex_sel.min(v.hex.len().saturating_sub(1));
+                self.views = Some(v);
+            }
             Event::Cfg(c) => {
                 let rip = self.snap.as_ref().map(|s| s.regs.rip);
                 let mut g = GraphView::new(c, &self.syms);
@@ -248,6 +327,17 @@ impl App {
                 self.found = Some(f);
                 self.list_scroll.set(0);
                 self.mode = ViewMode::Results;
+            }
+            Event::Gadgets(g) => {
+                self.gadgets = Some(g);
+                self.list_scroll.set(0);
+                self.mode = ViewMode::Gadgets;
+            }
+            Event::Statics(s) => {
+                // Cached, not a navigation: the user already switched to the
+                // tab they want (set_mode/run_command did that immediately);
+                // this just fills in the data once it's ready.
+                self.statics = Some(s);
             }
             Event::Pty(f) => self.pty = Some(f),
             Event::PtyOut(b) => self.term.process(&b),
@@ -378,14 +468,15 @@ impl App {
     pub fn pane_hint(&self) -> &'static str {
         match self.focus {
             Pane::Main => match self.mode {
-                ViewMode::Graph => "graph: [ ] select call | o follow | u back | Esc live | hjkl scroll | z centre | g or 1-4 view",
-                ViewMode::Disasm => "code: g or 1-4 switch view",
-                ViewMode::Source => "source: j/k scroll | z back to current line | g or 1-4 switch view",
-                ViewMode::Maps | ViewMode::Results => "list: j/k scroll | g or 1-4 switch view",
+                ViewMode::Graph => "graph: [ ] select call | o follow | u back | Esc live | hjkl scroll | z centre | g or 1-6 view",
+                ViewMode::Disasm => "code: g or 1-6 switch view",
+                ViewMode::Source => "source: j/k scroll | z back to current line | g or 1-6 switch view",
+                ViewMode::Maps | ViewMode::Results | ViewMode::Gadgets => "list: j/k scroll | g or 1-6 switch view",
+                ViewMode::Statics => "static: j/k scroll | [ ] switch tab | g or 1-6 switch view",
             },
             Pane::Regs => "regs: hjkl move | Enter hexdump value | v code | p stack | e edit | :set $rax 5",
             Pane::Stack => "stack: j/k select | Enter deref to hexdump | a slot address | v code | e patch | PgUp/PgDn | Home = rsp",
-            Pane::Hex => "hexdump: j/k PgUp/PgDn scroll | Enter follow pointer | e write | Home = rsp | :goto :write",
+            Pane::Hex => "hexdump: j/k PgUp/PgDn scroll | h/l select byte (inspector) | Enter follow pointer | e write | Home = rsp | :goto :write",
             Pane::Log => "log: j/k PgUp/PgDn scroll | G newest | :clear",
             Pane::Target => "target: Enter or i = type into the program (Ctrl-] leaves) | :send :sendline :clear",
         }
@@ -424,7 +515,9 @@ impl App {
                     ViewMode::Graph => ViewMode::Disasm,
                     ViewMode::Disasm if self.syms.has_lines() => ViewMode::Source,
                     ViewMode::Disasm | ViewMode::Source => ViewMode::Maps,
-                    ViewMode::Maps | ViewMode::Results => ViewMode::Graph,
+                    ViewMode::Maps | ViewMode::Results => ViewMode::Gadgets,
+                    ViewMode::Gadgets => ViewMode::Statics,
+                    ViewMode::Statics => ViewMode::Graph,
                 };
                 self.set_mode(next);
             }
@@ -432,6 +525,10 @@ impl App {
             KeyCode::Char('2') => self.set_mode(ViewMode::Disasm),
             KeyCode::Char('3') => self.set_mode(ViewMode::Source),
             KeyCode::Char('4') => self.set_mode(ViewMode::Maps),
+            KeyCode::Char('5') => self.set_mode(ViewMode::Gadgets),
+            KeyCode::Char('6') => self.open_statics(self.statics_tab),
+            KeyCode::Char('[') if self.mode == ViewMode::Statics => self.open_statics(self.statics_tab.prev()),
+            KeyCode::Char(']') if self.mode == ViewMode::Statics => self.open_statics(self.statics_tab.next()),
             KeyCode::Char('z') => {
                 self.src_off = 0;
                 self.center_pending.set(true);
@@ -546,6 +643,7 @@ impl App {
             .and_then(|v| v.hex.get(..8))
             .and_then(|b| <[u8; 8]>::try_from(b).ok())
             .map(u64::from_le_bytes);
+        let len = self.views.as_ref().map_or(0, |v| v.hex.len());
         match k.code {
             KeyCode::Up | KeyCode::Char('k') => {
                 if let Some(b) = base {
@@ -567,6 +665,9 @@ impl App {
                     self.goto_hex(Some(b.wrapping_add(64)));
                 }
             }
+            // Data inspector: move the selected byte within the current view.
+            KeyCode::Left | KeyCode::Char('h') => self.hex_sel = self.hex_sel.saturating_sub(1),
+            KeyCode::Right | KeyCode::Char('l') => self.hex_sel = (self.hex_sel + 1).min(len.saturating_sub(1)),
             KeyCode::Home => self.goto_hex(None),
             KeyCode::Enter => {
                 if let Some(p) = first {
@@ -860,11 +961,18 @@ impl App {
             self.src_off += dy.signum() * 3;
             return;
         }
-        if matches!(self.mode, ViewMode::Maps | ViewMode::Results) {
-            let n = if self.mode == ViewMode::Maps {
-                self.maps.len()
-            } else {
-                self.found.as_ref().map_or(0, |f| f.hits.len())
+        if matches!(self.mode, ViewMode::Maps | ViewMode::Results | ViewMode::Gadgets | ViewMode::Statics) {
+            let n = match self.mode {
+                ViewMode::Maps => self.maps.len(),
+                ViewMode::Results => self.found.as_ref().map_or(0, |f| f.hits.len()),
+                ViewMode::Gadgets => self.gadgets.as_ref().map_or(0, |g| g.items.len()),
+                _ => self.statics.as_ref().map_or(0, |s| match self.statics_tab {
+                    StaticsTab::Sections => s.sections.len(),
+                    StaticsTab::Segments => s.segments.len(),
+                    StaticsTab::Symtab => s.symbols.iter().filter(|r| r.name.contains(&self.sym_filter)).count(),
+                    StaticsTab::Imports => s.imports.iter().filter(|r| r.name.contains(&self.imp_filter)).count(),
+                    StaticsTab::Strings => s.strings.iter().filter(|r| r.text.contains(&self.str_filter)).count(),
+                }),
             };
             let y = self.list_scroll.get() as isize + dy.signum() * 3;
             self.list_scroll.set(y.clamp(0, n.saturating_sub(1) as isize) as usize);
@@ -882,6 +990,141 @@ impl App {
         if let Some(pid) = self.pid {
             let _ = kill(Pid::from_raw(pid), Signal::SIGSTOP);
             self.push_log("interrupting…");
+        }
+    }
+
+    /// Switch the main pane to a static-analysis tab. Computes the underlying
+    /// data once (lazily, on first visit) and caches it; later visits, and
+    /// switching tabs with `[`/`]`, are instant since they just re-slice the
+    /// same cached `StaticInfo` — no backend round-trip needed.
+    fn open_statics(&mut self, tab: StaticsTab) {
+        self.mode = ViewMode::Statics;
+        self.statics_tab = tab;
+        self.list_scroll.set(0);
+        if self.statics.is_none() {
+            self.push_log("running static analysis ...");
+            let _ = self.cmd_tx.send(Cmd::Statics);
+        }
+    }
+
+    /// On a crash, check whether any register's bytes look like they came
+    /// from a `cyclic` pattern, and if so report the offset directly —
+    /// the common "smashed the return address" pwn workflow, automated.
+    fn suggest_cyclic_offset(&mut self, sig: Signal, regs: &Regs) {
+        if !matches!(sig, Signal::SIGSEGV | Signal::SIGBUS | Signal::SIGILL) {
+            return;
+        }
+        let candidates: [(&str, u64); 9] = [
+            ("rip", regs.rip),
+            ("rsp", regs.rsp),
+            ("rbp", regs.rbp),
+            ("rax", regs.rax),
+            ("rbx", regs.rbx),
+            ("rcx", regs.rcx),
+            ("rdx", regs.rdx),
+            ("rsi", regs.rsi),
+            ("rdi", regs.rdi),
+        ];
+        let hits: Vec<String> = candidates
+            .into_iter()
+            .filter_map(|(name, v)| cyclic::find(&v.to_le_bytes()[..4]).map(|off| format!("{name}={v:#x} -> offset {off}")))
+            .collect();
+        if !hits.is_empty() {
+            self.push_log(format!("cyclic: pattern bytes found in {}", hits.join(", ")));
+        }
+    }
+
+    /// Offline ret2libc helper: given a libc file and one leaked symbol
+    /// (name + its runtime address), compute the load base and, from the
+    /// same file, the addresses of `system`/`execve` and the `/bin/sh`
+    /// string. This is plain offset arithmetic, not `one_gadget` — finding
+    /// a single-call `execve("/bin/sh", NULL, NULL)` gadget needs a
+    /// constraint solver over that exact libc build, which isn't
+    /// implemented here; this gives the inputs a manual ret2libc needs.
+    fn run_libc_helper(&mut self, path: &str, symbol: &str, leaked: Option<&str>) {
+        let data = match std::fs::read(path) {
+            Ok(d) => d,
+            Err(e) => return self.push_log(format!("libc: cannot read {path}: {e}")),
+        };
+        let info = match crate::analysis::statics::analyze(&data) {
+            Ok(i) => i,
+            Err(e) => return self.push_log(format!("libc: {e}")),
+        };
+        let find = |name: &str| info.symbols.iter().find(|s| s.name == name).map(|s| s.addr);
+        let Some(off) = find(symbol) else {
+            return self.push_log(format!("libc: '{symbol}' not found in {path}'s symbol table"));
+        };
+        self.push_log(format!("libc: {symbol} offset {off:#x} in {path}"));
+        let base = leaked.map(|l| parse_u64(l).map(|a| a.wrapping_sub(off)));
+        let base = match base {
+            Some(Ok(b)) => {
+                self.push_log(format!("predicted base: {b:#x}"));
+                for name in ["system", "execve", "__libc_system"] {
+                    if let Some(o) = find(name) {
+                        self.push_log(format!("  {name:<14} {:#x}", b.wrapping_add(o)));
+                    }
+                }
+                match info.strings.iter().find(|s| s.text == "/bin/sh") {
+                    Some(s) => self.push_log(format!("  {:<14} {:#x}  \"/bin/sh\"", "/bin/sh", b.wrapping_add(s.addr))),
+                    None => self.push_log("  (no \"/bin/sh\" string in this file's sections)"),
+                }
+                Some(b)
+            }
+            Some(Err(e)) => {
+                self.push_log(e);
+                None
+            }
+            None => None,
+        };
+
+        // one_gadget-style candidates: see analysis/onegadget.rs's doc comment
+        // for exactly what this does and doesn't prove.
+        match crate::analysis::onegadget::find(&data) {
+            Ok(gadgets) if gadgets.is_empty() => {
+                self.push_log("onegadget-lite: no execve/system call sites found (stripped symbols, or a libc build this heuristic doesn't match)");
+            }
+            Ok(gadgets) => {
+                let total = gadgets.len();
+                self.push_log(format!(
+                    "onegadget-lite: {total} candidate(s) — straight-line scan only, verify each by hand before using (see note below)"
+                ));
+                for g in gadgets.iter().take(15) {
+                    let addr_str = match base {
+                        Some(b) => format!("{:#014x} (file {:#x})", b.wrapping_add(g.addr), g.addr),
+                        None => format!("{:#014x} (file offset; give a leaked addr for the runtime address)", g.addr),
+                    };
+                    self.push_log(format!("  {addr_str}  via {}", g.via));
+                    for c in &g.constraints {
+                        self.push_log(format!("    {c}"));
+                    }
+                }
+                if total > 15 {
+                    self.push_log(format!("  ... and {} more", total - 15));
+                }
+                self.push_log(
+                    "note: not real one_gadget — single fallthrough path per candidate, no branch-following; \
+                     a reported constraint can be wrong if the live path takes a jump this scan didn't follow",
+                );
+            }
+            Err(e) => self.push_log(format!("onegadget-lite: {e}")),
+        }
+    }
+
+    /// Print the currently pinned struct overlay's fields to the log. The
+    /// hexdump pane shows the same thing live (see ui.rs); this is just a
+    /// scrollback-friendly copy of the same decode, run once on `struct <Name>`.
+    fn log_active_struct(&mut self) {
+        let Some((name, base)) = self.active_struct.clone() else { return };
+        let Some(def) = self.struct_defs.iter().find(|d| d.name == name) else { return };
+        let Some(v) = &self.views else { return };
+        if base < v.hex_addr || base + def.size as u64 > v.hex_addr + v.hex.len() as u64 {
+            self.push_log(format!("struct {name}: @ {base:#014x} isn't (fully) inside the current hexdump view"));
+            return;
+        }
+        let off = (base - v.hex_addr) as usize;
+        let fields = structs::decode(def, base, &v.hex[off..]);
+        for f in fields {
+            self.push_log(format!("  {:#014x}  {:<10} {:<10} {}", f.addr, f.name, f.ty_label, f.value));
         }
     }
 
@@ -920,6 +1163,10 @@ impl App {
             Ok(Command::Step) => self.resume(Cmd::Step),
             Ok(Command::Next) => self.resume(Cmd::Next),
             Ok(Command::Continue) => self.resume(Cmd::Continue),
+            Ok(Command::Finish) => self.resume(Cmd::Finish),
+            Ok(Command::Backtrace) => {
+                let _ = self.cmd_tx.send(Cmd::Backtrace);
+            }
             Ok(Command::Start) => {
                 let target = syms.addr("main").unwrap_or(syms.entry);
                 if target == 0 {
@@ -1022,6 +1269,172 @@ impl App {
             Ok(Command::Checksec) => {
                 let _ = self.cmd_tx.send(Cmd::Checksec);
             }
+            Ok(Command::Rop(filter)) => {
+                self.push_log("searching for gadgets ...");
+                let _ = self.cmd_tx.send(Cmd::Rop(filter));
+            }
+            Ok(Command::Sections) => self.open_statics(StaticsTab::Sections),
+            Ok(Command::Segments) => self.open_statics(StaticsTab::Segments),
+            Ok(Command::Symtab(f)) => {
+                self.sym_filter = f.unwrap_or_default();
+                self.open_statics(StaticsTab::Symtab);
+            }
+            Ok(Command::Imports(f)) => {
+                self.imp_filter = f.unwrap_or_default();
+                self.open_statics(StaticsTab::Imports);
+            }
+            Ok(Command::Strings(f)) => {
+                self.str_filter = f.unwrap_or_default();
+                self.open_statics(StaticsTab::Strings);
+            }
+            Ok(Command::Cyclic(cmd::CyclicOp::Gen(n))) => {
+                let (pat, truncated) = cyclic::generate(n);
+                for chunk in pat.chunks(64) {
+                    self.push_log(String::from_utf8_lossy(chunk).into_owned());
+                }
+                if truncated {
+                    self.push_log("(pattern repeats after 456976 bytes: offsets beyond that aren't unique)");
+                }
+            }
+            Ok(Command::Cyclic(cmd::CyclicOp::Send(n))) => {
+                let (pat, truncated) = cyclic::generate(n);
+                self.push_log(format!("cyclic: sending {n} byte(s) to the target"));
+                if truncated {
+                    self.push_log("(pattern repeats after 456976 bytes: offsets beyond that aren't unique)");
+                }
+                self.send_bytes(&pat);
+            }
+            Ok(Command::Libc { path, symbol, leaked }) => self.run_libc_helper(&path, &symbol, leaked.as_deref()),
+            Ok(Command::Struct(StructOp::Load(path))) => match std::fs::read_to_string(&path) {
+                Ok(text) => match structs::parse(&text) {
+                    Ok(defs) => {
+                        let names: Vec<String> = defs.iter().map(|d| d.name.clone()).collect();
+                        for d in defs {
+                            self.struct_defs.retain(|e| e.name != d.name);
+                            self.struct_defs.push(d);
+                        }
+                        self.push_log(format!("loaded {} struct(s) from {path}: {}", names.len(), names.join(", ")));
+                    }
+                    Err(e) => self.push_log(format!("struct: {e}")),
+                },
+                Err(e) => self.push_log(format!("struct: cannot read {path}: {e}")),
+            },
+            Ok(Command::Struct(StructOp::List)) => {
+                if self.struct_defs.is_empty() {
+                    self.push_log("no structs loaded: struct load <path>");
+                } else {
+                    let lines: Vec<String> = self.struct_defs.iter().map(|d| format!("{} ({} bytes, {} field(s))", d.name, d.size, d.fields.len())).collect();
+                    for l in lines {
+                        self.push_log(l);
+                    }
+                }
+            }
+            Ok(Command::Struct(StructOp::Clear)) => {
+                self.active_struct = None;
+                self.push_log("struct overlay cleared");
+            }
+            Ok(Command::Struct(StructOp::Apply(name, addr_expr))) => {
+                if !self.struct_defs.iter().any(|d| d.name == name) {
+                    self.push_log(format!("struct: '{name}' not loaded (struct load <path>, or struct list)"));
+                    return;
+                }
+                match addr_expr {
+                    Some(e) => match ev(&e) {
+                        Ok(addr) => {
+                            self.hex_sel = 0;
+                            self.goto_hex(Some(addr));
+                            self.active_struct = Some((name.clone(), addr));
+                            self.push_log(format!("struct {name} pinned @ {addr:#014x}"));
+                        }
+                        Err(m) => self.push_log(m),
+                    },
+                    None => match &self.views {
+                        Some(v) => {
+                            let base = v.hex_addr + self.hex_sel as u64;
+                            self.active_struct = Some((name.clone(), base));
+                            self.push_log(format!("struct {name} pinned @ {base:#014x} (hexdump cursor)"));
+                        }
+                        None => {
+                            self.push_log("struct: no hexdump yet (x [addr] first, or struct <Name> @<addr>)");
+                            return;
+                        }
+                    },
+                }
+                self.log_active_struct();
+            }
+            Ok(Command::Bookmark(BookmarkOp::List)) => {
+                if self.session.bookmarks.is_empty() {
+                    self.push_log("no bookmarks yet: bookmark <addr|sym> <label>");
+                } else {
+                    let lines: Vec<String> = self.session.bookmarks.iter().map(|b| format!("{:#014x}  {}", b.addr, b.label)).collect();
+                    for l in lines {
+                        self.push_log(l);
+                    }
+                }
+            }
+            Ok(Command::Bookmark(BookmarkOp::Add(a, label))) => match ev(&a) {
+                Ok(addr) => {
+                    self.session.add_bookmark(addr, label);
+                    self.push_log(format!("bookmarked {addr:#014x}"));
+                }
+                Err(m) => self.push_log(m),
+            },
+            Ok(Command::Bookmark(BookmarkOp::Del(a))) => match ev(&a) {
+                Ok(addr) => {
+                    if self.session.remove_bookmark(addr) {
+                        self.push_log(format!("removed bookmark at {addr:#014x}"));
+                    } else {
+                        self.push_log(format!("no bookmark at {addr:#014x}"));
+                    }
+                }
+                Err(m) => self.push_log(m),
+            },
+            Ok(Command::Note(NoteOp::List)) => {
+                if self.session.notes.is_empty() {
+                    self.push_log("no notes yet: note [@<addr|sym>] <text>");
+                } else {
+                    let lines: Vec<String> = self
+                        .session
+                        .notes
+                        .iter()
+                        .map(|n| match n.addr {
+                            Some(a) => format!("{a:#014x}  {}", n.text),
+                            None => format!("{:14}  {}", "-", n.text),
+                        })
+                        .collect();
+                    for l in lines {
+                        self.push_log(l);
+                    }
+                }
+            }
+            Ok(Command::Note(NoteOp::Add(addr_expr, text))) => {
+                let addr = match addr_expr {
+                    Some(e) => match ev(&e) {
+                        Ok(a) => Some(a),
+                        Err(m) => {
+                            self.push_log(m);
+                            return;
+                        }
+                    },
+                    // No @addr given: attach to the current pc if we have one, else a general note.
+                    None => regs.map(|r| r.rip),
+                };
+                self.session.add_note(addr, text);
+                match addr {
+                    Some(a) => self.push_log(format!("note added at {a:#014x}")),
+                    None => self.push_log("note added (no address)"),
+                }
+            }
+            Ok(Command::Cyclic(cmd::CyclicOp::Find(leak))) => match cyclic::parse_leak(&leak) {
+                Ok(bytes) => match cyclic::find(&bytes) {
+                    Some(off) => self.push_log(format!("cyclic: offset {off} (matched {} byte(s) little-endian)", bytes.len())),
+                    None => self.push_log(format!(
+                        "cyclic: {:?} not found in the default pattern (not from `cyclic`, or from a longer/custom one)",
+                        String::from_utf8_lossy(&bytes)
+                    )),
+                },
+                Err(e) => self.push_log(e),
+            },
             Ok(Command::Find(rest)) => match cmd::parse_find(&rest, regs.as_ref(), &syms) {
                 Ok((pat, filter, desc)) => {
                     self.push_log(format!("searching for {desc} ..."));
@@ -1041,6 +1454,16 @@ impl App {
 }
 
 /// Translate a key press into the bytes a terminal would send.
+/// A leaked address as the person would paste it: `0x...` hex or plain decimal.
+fn parse_u64(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16).map_err(|_| format!("bad hex address: {s}"))
+    } else {
+        s.parse::<u64>().map_err(|_| format!("bad address: {s}"))
+    }
+}
+
 fn key_bytes(k: &KeyEvent) -> Option<Vec<u8>> {
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     let alt = k.modifiers.contains(KeyModifiers::ALT);

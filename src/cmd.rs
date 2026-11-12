@@ -5,6 +5,10 @@ pub enum Command {
     Step,
     Next,
     Continue,
+    /// Run until the current function returns (frame-pointer walk for the return address).
+    Finish,
+    /// Frame-pointer backtrace from the current RIP/RBP.
+    Backtrace,
     Start,
     Break(String),
     Delete(String),
@@ -13,6 +17,21 @@ pub enum Command {
     /// vmmap [filter]
     Maps(Option<String>),
     Checksec,
+    /// rop [filter] — gadget search, optionally filtered by a substring of the disassembly.
+    Rop(Option<String>),
+    /// Switch the main pane to a static-analysis tab; each carries its own text filter.
+    Sections,
+    Segments,
+    Symtab(Option<String>),
+    Imports(Option<String>),
+    Strings(Option<String>),
+    /// cyclic N | cyclic send N | cyclic -l <leak>
+    Cyclic(CyclicOp),
+    /// libc <path> <leaked symbol> [leaked addr] — offline libc offset/base helper.
+    Libc { path: String, symbol: String, leaked: Option<String> },
+    Bookmark(BookmarkOp),
+    Note(NoteOp),
+    Struct(StructOp),
     Find(String),
     Modules,
     Sym(String),
@@ -27,6 +46,110 @@ pub enum Command {
     Help,
 }
 
+pub enum CyclicOp {
+    /// cyclic N — print N bytes of pattern.
+    Gen(usize),
+    /// cyclic send N — generate N bytes and write them straight to the target.
+    Send(usize),
+    /// cyclic -l <leak> — offset of a leaked value (hex word or literal text) in the pattern.
+    Find(String),
+}
+
+pub enum BookmarkOp {
+    /// (address expression, label)
+    Add(String, String),
+    /// address expression
+    Del(String),
+    List,
+}
+
+pub enum NoteOp {
+    /// (address expression if `@`-prefixed, text)
+    Add(Option<String>, String),
+    List,
+}
+
+pub enum StructOp {
+    /// path to a text file of `struct Name { ... }` blocks
+    Load(String),
+    List,
+    Clear,
+    /// (struct name, optional @addr expression)
+    Apply(String, Option<String>),
+}
+
+fn parse_struct(rest: &str) -> Result<Command, String> {
+    const USAGE: &str = "usage: struct load <path> | struct list | struct clear | struct <Name> [@<addr|sym>]";
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return Err(USAGE.into());
+    }
+    if let Some(p) = rest.strip_prefix("load") {
+        let p = p.trim();
+        return if p.is_empty() { Err(USAGE.into()) } else { Ok(Command::Struct(StructOp::Load(p.to_string()))) };
+    }
+    if rest == "list" {
+        return Ok(Command::Struct(StructOp::List));
+    }
+    if rest == "clear" {
+        return Ok(Command::Struct(StructOp::Clear));
+    }
+    let mut parts = rest.splitn(2, char::is_whitespace);
+    let name = parts.next().unwrap_or("").trim().to_string();
+    if name.is_empty() {
+        return Err(USAGE.into());
+    }
+    let addr = parts.next().map(str::trim).filter(|s| !s.is_empty()).map(|s| s.strip_prefix('@').unwrap_or(s).to_string());
+    Ok(Command::Struct(StructOp::Apply(name, addr)))
+}
+
+fn parse_bookmark(rest: &str) -> Result<Command, String> {
+    const USAGE: &str = "usage: bookmark <addr|sym> <label...> | bookmark del <addr|sym> | bookmark";
+    let rest = rest.trim();
+    if rest.is_empty() || rest == "list" {
+        return Ok(Command::Bookmark(BookmarkOp::List));
+    }
+    if let Some(e) = rest.strip_prefix("del").or_else(|| rest.strip_prefix("rm")) {
+        let e = e.trim();
+        return if e.is_empty() { Err(USAGE.into()) } else { Ok(Command::Bookmark(BookmarkOp::Del(e.to_string()))) };
+    }
+    match rest.split_once(char::is_whitespace) {
+        Some((addr, label)) if !label.trim().is_empty() => Ok(Command::Bookmark(BookmarkOp::Add(addr.to_string(), label.trim().to_string()))),
+        _ => Err(USAGE.into()),
+    }
+}
+
+fn parse_note(rest: &str) -> Result<Command, String> {
+    let rest = rest.trim();
+    if rest.is_empty() || rest == "list" {
+        return Ok(Command::Note(NoteOp::List));
+    }
+    if let Some(r) = rest.strip_prefix('@') {
+        let (addr, text) = r.split_once(char::is_whitespace).unwrap_or((r, ""));
+        if text.trim().is_empty() {
+            return Err("usage: note @<addr|sym> <text...>".into());
+        }
+        return Ok(Command::Note(NoteOp::Add(Some(addr.to_string()), text.trim().to_string())));
+    }
+    Ok(Command::Note(NoteOp::Add(None, rest.to_string())))
+}
+
+fn parse_cyclic(rest: &str) -> Result<Command, String> {
+    const USAGE: &str = "usage: cyclic <N> | cyclic send <N> | cyclic -l <leaked value>";
+    let rest = rest.trim();
+    if let Some(leak) = rest.strip_prefix("-l").or_else(|| rest.strip_prefix("find")) {
+        let leak = leak.trim();
+        if leak.is_empty() {
+            return Err(USAGE.into());
+        }
+        return Ok(Command::Cyclic(CyclicOp::Find(leak.to_string())));
+    }
+    if let Some(n) = rest.strip_prefix("send") {
+        return n.trim().parse().map(CyclicOp::Send).map(Command::Cyclic).map_err(|_| USAGE.to_string());
+    }
+    rest.parse().map(CyclicOp::Gen).map(Command::Cyclic).map_err(|_| USAGE.to_string())
+}
+
 pub fn parse(line: &str) -> Result<Command, String> {
     let line = line.trim();
     let (head, rest) = match line.split_once(char::is_whitespace) {
@@ -38,6 +161,8 @@ pub fn parse(line: &str) -> Result<Command, String> {
         "s" | "si" | "step" | "stepi" => Ok(Command::Step),
         "n" | "ni" | "next" | "nexti" => Ok(Command::Next),
         "c" | "cont" | "continue" => Ok(Command::Continue),
+    "finish" | "fin" => Ok(Command::Finish),
+    "bt" | "backtrace" | "where" => Ok(Command::Backtrace),
         "start" => Ok(Command::Start),
         "b" | "br" | "break" => match opt() {
             Some(e) => Ok(Command::Break(e)),
@@ -51,6 +176,26 @@ pub fn parse(line: &str) -> Result<Command, String> {
         "tele" | "telescope" | "stack" => Ok(Command::Stack(opt())),
         "vmmap" | "maps" => Ok(Command::Maps(opt())),
         "checksec" => Ok(Command::Checksec),
+        "rop" | "gadgets" => Ok(Command::Rop(opt())),
+        "sections" | "secs" => Ok(Command::Sections),
+        "segments" | "phdrs" => Ok(Command::Segments),
+        "symtab" | "syms" => Ok(Command::Symtab(opt())),
+        "imports" | "got" => Ok(Command::Imports(opt())),
+        "strings" | "str" => Ok(Command::Strings(opt())),
+        "cyclic" | "pattern" => parse_cyclic(rest),
+        "bookmark" | "bm" => parse_bookmark(rest),
+        "note" => parse_note(rest),
+        "struct" => parse_struct(rest),
+        "libc" => {
+            const USAGE: &str = "usage: libc <path-to-libc> <leaked symbol> [leaked addr]   e.g. libc ./libc.so.6 printf 0x7f1234561100";
+            let mut it = rest.split_whitespace();
+            match (it.next(), it.next()) {
+                (Some(path), Some(symbol)) => {
+                    Ok(Command::Libc { path: path.to_string(), symbol: symbol.to_string(), leaked: it.next().map(str::to_string) })
+                }
+                _ => Err(USAGE.into()),
+            }
+        }
         "find" | "search" | "grep" => {
             if rest.is_empty() {
                 Err("usage: find [str|hex|u64|u32|u16|u8] <pattern> [in <module|stack|heap>]".into())
@@ -240,10 +385,18 @@ pub const HELP: &[&str] = &[
     "start           run to main (or the ELF entry if stripped)",
     "b <addr>        breakpoint: main | main.c:42 | main+4 | 0x401136 | *0x401136 | $rip+4",
     "d <addr>        delete breakpoint",
-    "x [addr]        hexdump at addr (no arg: follow rsp)",
+    "x [addr]        hexdump at addr (no arg: follow rsp); h/l select a byte for the data inspector",
     "tele [addr]     stack telescope at addr (no arg: follow rsp)",
     "vmmap [word]    memory map view (j/k scroll); with a word, list matching mappings in the log",
     "checksec        RELRO / canary / NX / PIE / fortify of the executable",
+    "rop [filter]    ROP gadget search in the executable; rop pop rdi filters by text (5 or g to view)",
+    "sections | segments | symtab [filter] | imports [filter] | strings [filter]   static ELF browser (6 or g to view, [ ] switch tab)",
+    "cyclic <N> | cyclic send <N> | cyclic -l <leak>   De Bruijn pattern / crash-offset finder",
+    "libc <path> <leaked symbol> [leaked addr]   offline: symbol offset, base/system/execve/\"/bin/sh\" if given an addr, + onegadget-lite candidates",
+    "bt | finish         frame-pointer backtrace | run until the current function returns",
+    "bookmark <addr|sym> <label> | bookmark del <addr> | bookmark   add/remove/list, saved to <exe>.dbgt-session",
+    "note [@<addr|sym>] <text> | note   add a note (no @: attaches to current pc, or general) | list notes",
+    "struct load <path> | struct list | struct clear | struct <Name> [@<addr>]   ImHex-style overlay on the hexdump",
     "find <pat> [in <mod>]   search memory: find /bin/sh | find u64 $rsp | find hex 4883ec in libc",
     "modules         list modules with symbols loaded (libc appears after ld.so maps it)",
     "sym <expr>      what symbol is at this address",

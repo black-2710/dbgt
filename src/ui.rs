@@ -1,5 +1,6 @@
 use crate::analysis::symbols::short;
-use crate::app::{App, Pane, ViewMode, REG_ORDER};
+use crate::app::{App, Pane, StaticsTab, ViewMode, REG_ORDER};
+use crate::backend::Views;
 use std::collections::HashSet;
 use ratatui::{
     prelude::*,
@@ -47,6 +48,8 @@ fn render_pane(f: &mut Frame, app: &App, pane: Pane, area: Rect) {
             ViewMode::Source => source_lines(app, ih, iw),
             ViewMode::Maps => maps_lines(app, ih),
             ViewMode::Results => found_lines(app, ih),
+            ViewMode::Gadgets => gadgets_lines(app, ih),
+            ViewMode::Statics => statics_lines(app, ih),
         },
         Pane::Stack => {
             let t = app
@@ -206,6 +209,169 @@ fn found_lines(app: &App, h: usize) -> (Vec<Line<'static>>, String) {
     (lines, title)
 }
 
+/// Hits of the last `rop` search. Gadgets are coloured by the mnemonic in
+/// the final instruction (ret = plain, indirect jmp/call = flagged yellow,
+/// since the branch target is a register and may be tampered with).
+fn gadgets_lines(app: &App, h: usize) -> (Vec<Line<'static>>, String) {
+    let Some(g) = &app.gadgets else {
+        return (vec![Line::from("nothing searched yet: rop [filter]   e.g. rop pop rdi")], " rop ".into());
+    };
+    let title = format!(
+        " rop{}: {} gadget(s){} (j/k scroll, g or 1-5 switch view) ",
+        if g.filter.is_empty() { String::new() } else { format!(" '{}'", g.filter) },
+        g.items.len(),
+        if g.truncated { "+" } else { "" }
+    );
+    if g.items.is_empty() {
+        return (vec![Line::from("no gadgets matched")], title);
+    }
+    let start = app.list_scroll.get();
+    let lines = g
+        .items
+        .iter()
+        .skip(start)
+        .take(h)
+        .map(|(addr, text)| {
+            let last = text.rsplit(" ; ").next().unwrap_or(text);
+            let indirect = last.starts_with("jmp ") || last.starts_with("call ");
+            let tail_style = if indirect { Style::new().fg(Color::Yellow) } else { Style::new().fg(Color::Green) };
+            Line::from(vec![
+                Span::styled(format!("{addr:#014x}  "), Style::new().fg(Color::Blue)),
+                Span::styled(text.clone(), tail_style),
+            ])
+        })
+        .collect();
+    (lines, title)
+}
+
+const TABS: [StaticsTab; 5] =
+    [StaticsTab::Sections, StaticsTab::Segments, StaticsTab::Symtab, StaticsTab::Imports, StaticsTab::Strings];
+
+/// A binsider-style tab strip: the active tab highlighted, others dim.
+fn tab_strip(active: StaticsTab) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (i, t) in TABS.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        let style = if *t == active {
+            Style::new().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(Color::DarkGray)
+        };
+        spans.push(Span::styled(format!(" {} ", t.label()), style));
+    }
+    Line::from(spans)
+}
+
+/// Static ELF browser: sections / segments / symtab / imports / strings.
+/// Tabs switch with `[` / `]`; symtab, imports and strings take a filter
+/// via their command (`symtab <f>`, `imports <f>`, `strings <f>`).
+fn statics_lines(app: &App, h: usize) -> (Vec<Line<'static>>, String) {
+    let tab = app.statics_tab;
+    let title = format!(" static: {} ([ ] switch tab, j/k scroll, g or 1-6 switch view) ", tab.label());
+    let Some(s) = &app.statics else {
+        return (vec![Line::from("running static analysis ..."), tab_strip(tab)], title);
+    };
+
+    let head = |cols: &str| Line::from(Span::styled(cols.to_string(), Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+    let start = app.list_scroll.get();
+    let body_h = h.saturating_sub(2); // tab strip + header row
+
+    let mut lines = vec![tab_strip(tab)];
+    match tab {
+        StaticsTab::Sections => {
+            lines.push(head(&format!("{:<20} {:<14} {:>10} {:<4}  kind", "name", "addr", "size", "perm")));
+            lines.extend(s.sections.iter().skip(start).take(body_h).map(|r| {
+                Line::from(vec![
+                    Span::styled(format!("{:<20} ", r.name), Style::new().fg(Color::White)),
+                    Span::styled(format!("{:#014x} ", r.addr), Style::new().fg(Color::Blue)),
+                    Span::raw(format!("{:>10} ", r.size)),
+                    Span::styled(format!("{:<4} ", r.perm), perm_color(&r.perm)),
+                    Span::styled(r.kind.clone(), Style::new().fg(Color::DarkGray)),
+                ])
+            }));
+        }
+        StaticsTab::Segments => {
+            lines.push(head(&format!("{:<14} {:<14} {:<14} {:>10} {:>10} {:<4}", "kind", "offset", "vaddr", "filesz", "memsz", "perm")));
+            lines.extend(s.segments.iter().skip(start).take(body_h).map(|r| {
+                Line::from(vec![
+                    Span::styled(format!("{:<14} ", r.kind), Style::new().fg(Color::White)),
+                    Span::raw(format!("{:#012x}  ", r.offset)),
+                    Span::styled(format!("{:#014x} ", r.vaddr), Style::new().fg(Color::Blue)),
+                    Span::raw(format!("{:>10} ", r.filesz)),
+                    Span::raw(format!("{:>10} ", r.memsz)),
+                    Span::styled(r.perm.clone(), perm_color(&r.perm)),
+                ])
+            }));
+        }
+        StaticsTab::Symtab => {
+            lines.push(head(&format!("{:<14} {:>8} {:<10} {:<7}  name", "addr", "size", "kind", "bind")));
+            lines.extend(
+                s.symbols
+                    .iter()
+                    .filter(|r| r.name.contains(&app.sym_filter))
+                    .skip(start)
+                    .take(body_h)
+                    .map(|r| {
+                        Line::from(vec![
+                            Span::styled(format!("{:#014x} ", r.addr), Style::new().fg(Color::Blue)),
+                            Span::raw(format!("{:>8} ", r.size)),
+                            Span::styled(format!("{:<10} ", r.kind), Style::new().fg(Color::Magenta)),
+                            Span::styled(format!("{:<7} ", r.bind), Style::new().fg(Color::DarkGray)),
+                            Span::raw(r.name.clone()),
+                        ])
+                    }),
+            );
+        }
+        StaticsTab::Imports => {
+            lines.push(head(&format!("{:<14} {:<14}  name", "got", "plt")));
+            lines.extend(
+                s.imports
+                    .iter()
+                    .filter(|r| r.name.contains(&app.imp_filter))
+                    .skip(start)
+                    .take(body_h)
+                    .map(|r| {
+                        let plt = r.plt.map(|a| format!("{a:#014x}")).unwrap_or_else(|| "-".into());
+                        Line::from(vec![
+                            Span::styled(format!("{:#014x} ", r.got), Style::new().fg(Color::Green)),
+                            Span::styled(format!("{plt:<14} "), Style::new().fg(Color::Blue)),
+                            Span::raw(r.name.clone()),
+                        ])
+                    }),
+            );
+        }
+        StaticsTab::Strings => {
+            lines.push(head("addr            text"));
+            lines.extend(
+                s.strings
+                    .iter()
+                    .filter(|r| r.text.contains(&app.str_filter))
+                    .skip(start)
+                    .take(body_h)
+                    .map(|r| {
+                        Line::from(vec![
+                            Span::styled(format!("{:#014x}  ", r.addr), Style::new().fg(Color::Blue)),
+                            Span::styled(r.text.clone(), Style::new().fg(Color::Yellow)),
+                        ])
+                    }),
+            );
+        }
+    }
+    (lines, title)
+}
+
+fn perm_color(perm: &str) -> Style {
+    if perm.contains('x') {
+        Style::new().fg(Color::Red)
+    } else if perm.contains('w') {
+        Style::new().fg(Color::Green)
+    } else {
+        Style::new().fg(Color::White)
+    }
+}
+
 fn vt_color(c: vt100::Color) -> Color {
     match c {
         vt100::Color::Default => Color::Reset,
@@ -315,25 +481,135 @@ fn stack_lines(app: &App, height: usize) -> Vec<Line<'static>> {
         .collect()
 }
 
+/// hexyl-style byte class: null bytes dim, printable ASCII cyan, whitespace
+/// green, other control bytes yellow, the rest (high/non-ASCII) magenta.
+fn byte_class_color(b: u8) -> Color {
+    match b {
+        0x00 => Color::DarkGray,
+        0x20..=0x7e => Color::Cyan,
+        0x09 | 0x0a | 0x0d | 0x0b | 0x0c => Color::Green,
+        0x01..=0x1f | 0x7f => Color::Yellow,
+        _ => Color::Magenta,
+    }
+}
+
+/// ImHex-style data inspector: the selected byte decoded every which way.
+/// Two lines so it fits a narrow pane: integers (hex + decimal) on one,
+/// floats and a short ASCII preview on the other.
+fn inspector_lines(hex: &[u8], base: u64, sel: usize) -> Vec<Line<'static>> {
+    if hex.is_empty() {
+        return vec![Line::from("(no bytes here)")];
+    }
+    let sel = sel.min(hex.len() - 1);
+    let avail = hex.len() - sel;
+    let take = |n: usize| (avail >= n).then(|| {
+        let mut buf = [0u8; 8];
+        buf[..n].copy_from_slice(&hex[sel..sel + n]);
+        buf
+    });
+    let u16v = take(2).map(|b| u16::from_le_bytes([b[0], b[1]]));
+    let u32v = take(4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let u64v = take(8).map(u64::from_le_bytes);
+
+    let lab = |s: &str| Span::styled(format!("{s} "), Style::new().fg(Color::DarkGray));
+    let val = |s: String| Span::styled(format!("{s}  "), Style::new().fg(Color::White));
+    let na = || "-".to_string();
+
+    let line1 = Line::from(vec![
+        Span::styled(format!("@{:#014x}  ", base + sel as u64), Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD)),
+        lab("u8"),
+        val(format!("{:#04x} ({})", hex[sel], hex[sel])),
+        lab("i8"),
+        val(format!("{}", hex[sel] as i8)),
+        lab("u16"),
+        val(u16v.map(|v| format!("{v:#06x} ({v})")).unwrap_or_else(na)),
+        lab("u32"),
+        val(u32v.map(|v| format!("{v:#010x} ({v})")).unwrap_or_else(na)),
+        lab("u64"),
+        val(u64v.map(|v| format!("{v:#018x}")).unwrap_or_else(na)),
+    ]);
+    let ascii: String = hex[sel..(sel + 16).min(hex.len())]
+        .iter()
+        .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+        .collect();
+    let line2 = Line::from(vec![
+        lab("i32"),
+        val(u32v.map(|v| format!("{}", v as i32)).unwrap_or_else(na)),
+        lab("i64"),
+        val(u64v.map(|v| format!("{}", v as i64)).unwrap_or_else(na)),
+        lab("f32"),
+        val(u32v.map(|v| format!("{}", f32::from_bits(v))).unwrap_or_else(na)),
+        lab("f64"),
+        val(u64v.map(|v| format!("{}", f64::from_bits(v))).unwrap_or_else(na)),
+        lab("str"),
+        Span::styled(format!("\"{ascii}\""), Style::new().fg(Color::Yellow)),
+    ]);
+    vec![line1, line2]
+}
+
+/// A pinned `struct` overlay for the current hexdump view, if one is active
+/// and (at least fully) within it. `None` means "nothing pinned": fall back
+/// to the plain byte inspector.
+fn struct_overlay_lines(app: &App, v: &Views) -> Option<Vec<Line<'static>>> {
+    let (name, base) = app.active_struct.as_ref()?;
+    let def = app.struct_defs.iter().find(|d| &d.name == name)?;
+    if *base < v.hex_addr || *base + def.size as u64 > v.hex_addr + v.hex.len() as u64 {
+        return Some(vec![Line::from(Span::styled(
+            format!("struct {name} @ {base:#014x} — out of the current hexdump view (x {base:#x} to bring it in)"),
+            Style::new().fg(Color::Yellow),
+        ))]);
+    }
+    let off = (*base - v.hex_addr) as usize;
+    let fields = crate::structs::decode(def, *base, &v.hex[off..]);
+    let mut lines = vec![Line::from(Span::styled(
+        format!("struct {name} @ {base:#014x}  ({} field(s) — struct clear to unpin)", fields.len()),
+        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    ))];
+    for f in fields.iter().take(8) {
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {:<10} ", f.name), Style::new().fg(Color::White)),
+            Span::styled(format!("{:<9} ", f.ty_label), Style::new().fg(Color::DarkGray)),
+            Span::styled(f.value.clone(), Style::new().fg(Color::Yellow)),
+        ]));
+    }
+    if fields.len() > 8 {
+        lines.push(Line::from(format!("  ... and {} more field(s) (see the log)", fields.len() - 8)));
+    }
+    Some(lines)
+}
+
 fn hex_lines(app: &App, height: usize) -> Vec<Line<'static>> {
     let Some(v) = &app.views else { return Vec::new() };
-    v.hex
-        .chunks(8)
-        .take(height)
-        .enumerate()
-        .map(|(i, chunk)| {
-            let hex = chunk.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ");
-            let ascii: String = chunk
-                .iter()
-                .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
-                .collect();
-            Line::from(vec![
-                Span::styled(format!("{:#014x}", v.hex_addr + 8 * i as u64), Style::new().fg(Color::Blue)),
-                Span::raw(format!("  {hex:<23}  ")),
-                Span::styled(ascii, Style::new().fg(Color::Yellow)),
-            ])
-        })
-        .collect()
+    let focused = app.focus == Pane::Hex;
+    let mut lines = struct_overlay_lines(app, v).unwrap_or_else(|| inspector_lines(&v.hex, v.hex_addr, app.hex_sel));
+    lines.push(Line::from(""));
+    let body_h = height.saturating_sub(lines.len());
+    lines.extend(v.hex.chunks(8).take(body_h).enumerate().map(|(i, chunk)| {
+        let mut spans = vec![Span::styled(format!("{:#014x}", v.hex_addr + 8 * i as u64), Style::new().fg(Color::Blue)), Span::raw("  ")];
+        for (col, &b) in chunk.iter().enumerate() {
+            let sel = focused && i * 8 + col == app.hex_sel;
+            let mut style = Style::new().fg(byte_class_color(b));
+            if sel {
+                style = style.bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD);
+            }
+            spans.push(Span::styled(format!("{b:02x} "), style));
+        }
+        for _ in chunk.len()..8 {
+            spans.push(Span::raw("   "));
+        }
+        spans.push(Span::raw(" "));
+        for (col, &b) in chunk.iter().enumerate() {
+            let ch = if (0x20..0x7f).contains(&b) { b as char } else { '.' };
+            let sel = focused && i * 8 + col == app.hex_sel;
+            let mut style = Style::new().fg(byte_class_color(b));
+            if sel {
+                style = style.bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD);
+            }
+            spans.push(Span::styled(ch.to_string(), style));
+        }
+        Line::from(spans)
+    }));
+    lines
 }
 
 fn flags(v: u64) -> String {
@@ -443,6 +719,9 @@ fn code_lines(app: &App, height: usize) -> Vec<Line<'static>> {
             if let Some((n, off)) = app.syms.lookup(ins.addr) {
                 let tag = if off == 0 { format!("  <{n}>") } else { format!("  <{n}+{off:#x}>") };
                 line.spans.push(Span::styled(tag, Style::new().fg(Color::Green)));
+            }
+            if let Some(label) = app.session.bookmark_at(ins.addr) {
+                line.spans.push(Span::styled(format!("  ★ {label}"), Style::new().fg(Color::Magenta)));
             }
             if new_line[idx] {
                 if let Some((p, l)) = app.syms.line(ins.addr) {

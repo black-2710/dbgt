@@ -7,10 +7,13 @@ mod ptrace;
 use crate::analysis::{
     cfg::{self, Cfg},
     checksec,
+    gadgets::{self, Region},
+    statics::{self, StaticInfo},
     symbols::{short, Symbols},
 };
 use anyhow::Result;
 use nix::sys::signal::Signal;
+use object::{Object, ObjectSection};
 use std::{
     collections::{HashMap, HashSet},
     fmt,
@@ -164,10 +167,22 @@ pub struct Found {
     pub truncated: bool,
 }
 
+/// Result of `rop`: gadgets found in the executable's own code (not libraries).
+pub struct GadgetList {
+    /// Empty when unfiltered.
+    pub filter: String,
+    pub items: Vec<(u64, String)>,
+    pub truncated: bool,
+}
+
 pub enum Cmd {
     Step,
     Next,
     Continue,
+    /// Run until the current function returns (frame-pointer walk for the return address).
+    Finish,
+    /// Frame-pointer backtrace from the current RIP/RBP.
+    Backtrace,
     Break(u64),
     Delete(u64),
     Stack(Option<u64>),
@@ -175,6 +190,11 @@ pub enum Cmd {
     /// Search every readable mapping (optionally only those whose path contains `filter`).
     Find { pat: Vec<u8>, filter: Option<String>, desc: String },
     Checksec,
+    /// ROP gadget search in the main executable; optional substring filter (e.g. "pop rdi").
+    Rop(Option<String>),
+    /// Static analysis of the main executable: sections, segments, symbols, imports, strings.
+    /// Computed once and cached by the UI; this is only sent when the cache is empty.
+    Statics,
     SetReg { name: String, value: u64 },
     WriteMem { addr: u64, bytes: Vec<u8> },
     /// Build a CFG for the function containing this address (call-following).
@@ -193,6 +213,8 @@ pub enum Event {
     BrowseCfg(Arc<Cfg>),
     Maps(Arc<Vec<MapEntry>>),
     Found(Found),
+    Gadgets(Arc<GadgetList>),
+    Statics(Arc<StaticInfo>),
     Symbols(Arc<Symbols>),
     Ended(Stop),
     Breakpoints(Vec<u64>),
@@ -331,6 +353,24 @@ fn find_in_memory(t: &Tracee, syms: &Symbols, pat: &[u8], filter: Option<&str>, 
 }
 
 /// Report a stop. Rebuilds the CFG only when RIP left the one the UI already has.
+/// One frame-pointer hop from a standard `push rbp; mov rbp, rsp` prologue:
+/// `[rbp]` is the caller's saved rbp, `[rbp+8]` is the return address. `None`
+/// if `rbp` is null or the 16 bytes at it aren't (fully) readable — which is
+/// also what happens with `-fomit-frame-pointer`, since rbp is then just
+/// another general-purpose register and this walk isn't meaningful.
+fn frame_hop(t: &Tracee, rbp: u64) -> Option<(u64, u64)> {
+    if rbp == 0 {
+        return None;
+    }
+    let b = t.read_mem(rbp, 16);
+    if b.len() < 16 {
+        return None;
+    }
+    let saved_rbp = u64::from_le_bytes(b[0..8].try_into().ok()?);
+    let ret = u64::from_le_bytes(b[8..16].try_into().ok()?);
+    Some((saved_rbp, ret))
+}
+
 fn send_stop(
     t: &Tracee,
     syms: &Symbols,
@@ -559,6 +599,102 @@ fn run(program: &Path, args: &[String], rx: &Receiver<Cmd>, ev: &Sender<Event>) 
                 }
                 continue;
             }
+            Cmd::Rop(filter) => {
+                let data = t.exe_path().and_then(|p| std::fs::read(&p).ok());
+                match data.as_deref().map(object::File::parse) {
+                    Some(Ok(file)) => {
+                        let mut items = Vec::new();
+                        let mut truncated = false;
+                        for sec in file.sections() {
+                            if sec.kind() != object::SectionKind::Text {
+                                continue;
+                            }
+                            let Ok(bytes) = sec.data() else { continue };
+                            let region = Region { base: sec.address(), bytes };
+                            let (found, trunc) = gadgets::find_gadgets(&region, 4000 - items.len());
+                            truncated |= trunc;
+                            items.extend(found.into_iter().map(|g| (g.addr, g.text)));
+                            if items.len() >= 4000 {
+                                truncated = true;
+                                break;
+                            }
+                        }
+                        let filter = filter.unwrap_or_default();
+                        if !filter.is_empty() {
+                            items.retain(|(_, t)| t.contains(&filter));
+                        }
+                        items.sort_by_key(|(a, _)| *a);
+                        let n = items.len();
+                        let _ = ev.send(Event::Gadgets(Arc::new(GadgetList { filter: filter.clone(), items, truncated })));
+                        let _ = ev.send(Event::Log(format!(
+                            "rop{}: {n} gadget(s){}",
+                            if filter.is_empty() { String::new() } else { format!(" (filter '{filter}')") },
+                            if truncated { " (stopped at the limit: narrow with a filter)" } else { "" }
+                        )));
+                    }
+                    Some(Err(e)) => {
+                        let _ = ev.send(Event::Log(format!("rop: cannot parse the executable: {e}")));
+                    }
+                    None => {
+                        let _ = ev.send(Event::Log("rop: cannot read the executable".into()));
+                    }
+                }
+                continue;
+            }
+            Cmd::Statics => {
+                let data = t.exe_path().and_then(|p| std::fs::read(&p).ok());
+                match data.as_deref().map(statics::analyze) {
+                    Some(Ok(info)) => {
+                        let _ = ev.send(Event::Log(format!(
+                            "static analysis: {} section(s), {} segment(s), {} symbol(s), {} import(s), {} string(s){}",
+                            info.sections.len(),
+                            info.segments.len(),
+                            info.symbols.len(),
+                            info.imports.len(),
+                            info.strings.len(),
+                            if info.strings_truncated { " (truncated)" } else { "" }
+                        )));
+                        let _ = ev.send(Event::Statics(Arc::new(info)));
+                    }
+                    Some(Err(e)) => {
+                        let _ = ev.send(Event::Log(format!("static analysis: {e}")));
+                    }
+                    None => {
+                        let _ = ev.send(Event::Log("static analysis: cannot read the executable".into()));
+                    }
+                }
+                continue;
+            }
+            Cmd::Backtrace => {
+                let r = t.regs()?;
+                let describe = |addr: u64| match syms.lookup(addr) {
+                    Some((n, 0)) => format!("{addr:#014x} <{n}>"),
+                    Some((n, off)) => format!("{addr:#014x} <{n}+{off:#x}>"),
+                    None => format!("{addr:#014x}"),
+                };
+                let mut lines = vec![format!("#0  {}", describe(r.rip))];
+                let mut rbp = r.rbp;
+                while lines.len() < 64 {
+                    match frame_hop(&t, rbp) {
+                        Some((saved_rbp, ret)) if ret != 0 => {
+                            lines.push(format!("#{}  {}", lines.len(), describe(ret)));
+                            if saved_rbp <= rbp {
+                                break; // corrupted or cyclic chain: stop rather than loop
+                            }
+                            rbp = saved_rbp;
+                        }
+                        _ => break,
+                    }
+                }
+                let _ = ev.send(Event::Log(format!(
+                    "backtrace: {} frame(s) (frame-pointer walk; may be incomplete if built with -fomit-frame-pointer)",
+                    lines.len()
+                )));
+                for l in lines {
+                    let _ = ev.send(Event::Log(l));
+                }
+                continue;
+            }
             Cmd::Stack(a) => {
                 cfg.stack = a;
                 if alive {
@@ -584,6 +720,16 @@ fn run(program: &Path, args: &[String], rx: &Receiver<Cmd>, ev: &Sender<Event>) 
             Cmd::Step => t.step()?,
             Cmd::Next => t.next()?,
             Cmd::Continue => t.cont(None)?,
+            Cmd::Finish => {
+                let r = t.regs()?;
+                match frame_hop(&t, r.rbp) {
+                    Some((_, ret)) if ret != 0 => t.cont(Some((ret, r.rsp)))?,
+                    _ => {
+                        let _ = ev.send(Event::Log("finish: no usable frame pointer here (built with -fomit-frame-pointer?)".into()));
+                        continue;
+                    }
+                }
+            }
         };
 
         if let Stop::Watch(slot) = stop {
